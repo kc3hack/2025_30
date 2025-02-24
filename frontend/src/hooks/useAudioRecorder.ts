@@ -7,151 +7,69 @@ export const useAudioRecorder = () => {
   const [recordingTime, setRecordingTime] = useState(0);
   const [transcribedText, setTranscribedText] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [waveformData, setWaveformData] = useState<number[][]>([]);  // 波形データを2次元配列に変更
-  const waveformBufferRef = useRef<number[][]>([]);  // 波形データのバッファ
-  const lastUpdateTimeRef = useRef<number>(0);
-  
   const mediaRecorder = useRef<MediaRecorder | null>(null);
-  const audioContext = useRef<AudioContext | null>(null);
-  const analyser = useRef<AnalyserNode | null>(null);
-  const animationFrame = useRef<number | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
 
   const startRecording = useCallback(async () => {
     try {
-      // AudioContext の状態をログ出力
-      console.log('AudioContext initial state:', {
-        exists: !!audioContext.current,
-        state: audioContext.current?.state
-      });
-
-      // AudioContext の再利用または新規作成
-      if (!audioContext.current || audioContext.current.state === 'closed') {
-        audioContext.current = new AudioContext();
-        console.log('Created new AudioContext');
-      } else if (audioContext.current.state === 'suspended') {
-        await audioContext.current.resume();
-        console.log('Resumed existing AudioContext');
-      }
-
-      console.log('AudioContext after initialization:', {
-        state: audioContext.current.state,
-        sampleRate: audioContext.current.sampleRate
-      });
-
       const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: {
-          channelCount: 1,
-          sampleRate: 16000,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
+          channelCount: 1,         // モノラル録音
+          sampleRate: 16000,       // Whisper推奨のサンプルレート
+          echoCancellation: true,  // エコーキャンセル有効
+          noiseSuppression: true,  // ノイズ抑制有効
+          autoGainControl: true    // 自動ゲイン制御有効
         } 
       });
 
-      console.log('Audio stream created:', {
-        tracks: stream.getAudioTracks().length,
-        trackSettings: stream.getAudioTracks()[0].getSettings()
-      });
-
-      const source = audioContext.current.createMediaStreamSource(stream);
-      analyser.current = audioContext.current.createAnalyser();
-      analyser.current.fftSize = 1024; // パフォーマンスを考慮して調整
-      analyser.current.smoothingTimeConstant = 0.5; // より滑らかな波形に
-      source.connect(analyser.current);
-
-      // 録音開始時に波形データをクリア
-      setWaveformData([]);
-      waveformBufferRef.current = [];
-
       const recorder = new MediaRecorder(stream, {
         mimeType: 'audio/webm;codecs=opus',
-        audioBitsPerSecond: 128000
+        audioBitsPerSecond: 128000 // 128kbpsで録音
       });
-
       const chunks: BlobPart[] = [];
+
       recorder.ondataavailable = (e) => {
         if (e.data.size > 0) {
           chunks.push(e.data);
+          console.log('Audio chunk received:', {
+            chunkSize: e.data.size,
+            totalChunks: chunks.length
+          });
         }
       };
 
       recorder.onstop = async () => {
+        console.log('Recording stopped, processing chunks:', {
+          numberOfChunks: chunks.length,
+          totalSize: chunks.reduce((size, chunk) => size + (chunk as Blob).size, 0)
+        });
+
         const blob = new Blob(chunks, { type: 'audio/webm;codecs=opus' });
         setAudioData(blob);
+        
+        console.log('Created audio blob:', {
+          type: blob.type,
+          size: blob.size
+        });
+        
         const url = URL.createObjectURL(blob);
         setAudioUrl(url);
       };
 
-      // 波形データの更新関数を最適化
-      let isUpdating = true;
-      const updateWaveform = () => {
-        if (!analyser.current || !isUpdating) return;
-
-        try {
-          const currentTime = Date.now();
-          // 更新頻度を30fpsに調整（約33ms間隔）
-          if (currentTime - lastUpdateTimeRef.current < 33) {
-            animationFrame.current = requestAnimationFrame(updateWaveform);
-            return;
-          }
-          lastUpdateTimeRef.current = currentTime;
-
-          const bufferLength = analyser.current.frequencyBinCount;
-          const dataArray = new Uint8Array(bufferLength);
-          analyser.current.getByteTimeDomainData(dataArray);
-
-          // サンプル数を最適化（画面の幅に対して適切な数に）
-          const samplesPerFrame = 50; // フレームあたりのサンプル数
-          const skipFactor = Math.max(1, Math.floor(bufferLength / samplesPerFrame));
-          const reducedData = [];
-
-          for (let i = 0; i < bufferLength; i += skipFactor) {
-            const normalizedValue = (dataArray[i] / 128.0) - 1;
-            reducedData.push(normalizedValue);
-          }
-
-          // 常にデータを追加
-          waveformBufferRef.current.push(reducedData);
-          
-          // 録音時間に応じてデータを調整（最大60秒分）
-          const maxFrames = 30 * 60; // 30fps × 60秒
-          if (waveformBufferRef.current.length > maxFrames) {
-            // 古いデータを間引く（2フレームごとに1フレーム保持）
-            waveformBufferRef.current = waveformBufferRef.current
-              .filter((_, index) => index % 2 === 0)
-              .slice(-maxFrames);
-          }
-
-          setWaveformData([...waveformBufferRef.current]);
-
-        } catch (error) {
-          console.error('Error updating waveform:', error);
-          isUpdating = false;
-          return;
-        }
-
-        if (isUpdating) {
-          animationFrame.current = requestAnimationFrame(updateWaveform);
-        }
-      };
-
-      recorder.start(100);
+      recorder.start(100); // 100msごとにデータを取得
       mediaRecorder.current = recorder;
       setIsRecording(true);
       setRecordingTime(0);
-
-      // アニメーションフレームの管理
-      if (animationFrame.current) {
-        cancelAnimationFrame(animationFrame.current);
-      }
-      isUpdating = true;
-      updateWaveform();
-
+      
       timerRef.current = setInterval(() => {
         setRecordingTime(prev => prev + 1);
       }, 1000);
 
+      console.log('Recording started with settings:', {
+        sampleRate: 16000,
+        channelCount: 1,
+        bitRate: 128000
+      });
     } catch (error) {
       console.error('Error accessing microphone:', error);
     }
@@ -161,16 +79,7 @@ export const useAudioRecorder = () => {
     if (mediaRecorder.current && mediaRecorder.current.state !== 'inactive') {
       mediaRecorder.current.stop();
       mediaRecorder.current.stream.getTracks().forEach(track => track.stop());
-      
-      // 波形更新の即時停止
-      if (animationFrame.current) {
-        cancelAnimationFrame(animationFrame.current);
-        animationFrame.current = null;
-      }
-      
-      // AudioContextはすぐには閉じない（再利用のため）
       setIsRecording(false);
-      
       if (timerRef.current) {
         clearInterval(timerRef.current);
       }
@@ -183,10 +92,21 @@ export const useAudioRecorder = () => {
     setIsProcessing(true);
     try {
       const formData = new FormData();
+      // 音声ファイルの名前とMIMEタイプを明示的に指定
       const audioFile = new File([audioData], 'audio.webm', {
         type: 'audio/webm;codecs=opus'
       });
       formData.append('audio', audioFile);
+
+      // 音声データをArrayBufferに変換してローカルストレージに保存
+      const arrayBuffer = await audioFile.arrayBuffer();
+      const uint8Array = new Uint8Array(arrayBuffer);
+      console.log('Storing audio data:', {
+        arrayBufferSize: arrayBuffer.byteLength,
+        uint8ArrayLength: uint8Array.length,
+        firstBytes: Array.from(uint8Array.slice(0, 10))
+      });
+      localStorage.setItem('kc3_audio_data', JSON.stringify(Array.from(uint8Array)));
 
       console.log('Sending audio for transcription:', {
         fileName: audioFile.name,
@@ -199,41 +119,27 @@ export const useAudioRecorder = () => {
         body: formData,
       });
 
-      const data = await response.json();
-
       if (!response.ok) {
-        throw new Error(data.details || `HTTP error! status: ${response.status}`);
+        throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      if (!data.text && !data.error) {
-        throw new Error('No transcription data received from server');
-      }
-
-      if (data.error) {
-        throw new Error(data.error);
-      }
-
+      const data = await response.json();
       console.log('Transcription response:', data);
-      setTranscribedText(data.text);
+
+      if (data.text) {
+        setTranscribedText(data.text);
+      } else {
+        throw new Error('No transcription received');
+      }
     } catch (error) {
       console.error('Transcription error:', error);
-      // エラーメッセージをユーザーに表示するための状態を追加
-      setTranscribedText(null);
-      throw error; // エラーを上位コンポーネントで処理できるように再スロー
     } finally {
       setIsProcessing(false);
     }
   };
 
-  // クリーンアップ用のエフェクトを追加
   useEffect(() => {
     return () => {
-      if (animationFrame.current) {
-        cancelAnimationFrame(animationFrame.current);
-      }
-      if (audioContext.current) {
-        audioContext.current.close();
-      }
       if (timerRef.current) {
         clearInterval(timerRef.current);
       }
@@ -253,6 +159,5 @@ export const useAudioRecorder = () => {
     transcribeAudio,
     transcribedText,
     isProcessing,
-    waveformData,
   };
 };

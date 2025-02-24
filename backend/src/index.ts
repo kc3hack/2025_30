@@ -55,21 +55,13 @@ app.post('/transcribe', async (c) => {
     console.log('Received audio file:', {
       type: audioFile.type,
       size: audioFile.size,
-      name: audioFile.name,
-      lastModified: audioFile.lastModified
+      name: audioFile.name
     });
 
     // 一時ファイルパスの設定
     const tempDir = path.join(__dirname, '../temp');
-    console.log('Temp directory:', {
-      path: tempDir,
-      exists: fs.existsSync(tempDir),
-      permissions: fs.statSync(tempDir).mode.toString(8)
-    });
-
     if (!fs.existsSync(tempDir)) {
       fs.mkdirSync(tempDir, { recursive: true });
-      console.log('Created temp directory');
     }
 
     const tempId = uuidv4();
@@ -77,29 +69,15 @@ app.post('/transcribe', async (c) => {
     const outputPath = path.join(tempDir, `output-${tempId}.mp3`);
 
     // 音声ファイルを一時保存
-    try {
-      const arrayBuffer = await audioFile.arrayBuffer();
-      const inputBuffer = Buffer.from(arrayBuffer);
-      
-      console.log('Processing audio file:', {
-        bufferSize: inputBuffer.length,
-        firstBytes: Array.from(inputBuffer.slice(0, 16)),
-        isValidWebM: inputBuffer.slice(0, 4).toString('hex') === '1a45dfa3'
-      });
-      
-      fs.writeFileSync(inputPath, inputBuffer);
-      console.log('Saved input file:', {
-        path: inputPath,
-        size: fs.statSync(inputPath).size,
-        exists: fs.existsSync(inputPath)
-      });
-    } catch (error) {
-      console.error('Error saving audio file:', error);
-      return c.json({ 
-        error: 'Failed to save audio file',
-        details: error instanceof Error ? error.message : 'Unknown error'
-      }, 500);
-    }
+    const arrayBuffer = await audioFile.arrayBuffer();
+    const inputBuffer = Buffer.from(arrayBuffer);
+    
+    console.log('Writing input file:', {
+      bufferSize: inputBuffer.length,
+      firstBytes: Array.from(inputBuffer.slice(0, 16)), // WebMヘッダーの確認
+    });
+    
+    fs.writeFileSync(inputPath, inputBuffer);
 
     console.log('Converting audio file:', {
       inputPath,
@@ -108,69 +86,60 @@ app.post('/transcribe', async (c) => {
     });
 
     // WebMからMP3に変換（Whisper向けに最適化）
-    try {
-      await new Promise((resolve, reject) => {
-        interface FFmpegProgress {
-          frames: number;
-          currentFps: number;
-          currentKbps: number;
-          targetSize: number;
-          timemark: string;
-          percent?: number;
-        }
+    await new Promise((resolve, reject) => {
+      interface FFmpegProgress {
+        frames: number;
+        currentFps: number;
+        currentKbps: number;
+        targetSize: number;
+        timemark: string;
+        percent?: number;
+      }
 
-        let progressData: FFmpegProgress = {
-          frames: 0,
-          currentFps: 0,
-          currentKbps: 0,
-          targetSize: 0,
-          timemark: '00:00:00',
-          percent: 0
-        };
+      let progressData: FFmpegProgress = {
+        frames: 0,
+        currentFps: 0,
+        currentKbps: 0,
+        targetSize: 0,
+        timemark: '00:00:00',
+        percent: 0
+      };
 
-        ffmpeg(inputPath)
-          .toFormat('mp3')
-          .audioChannels(1)           // モノラル
-          .audioFrequency(16000)      // Whisper推奨のサンプルレート
-          .audioBitrate('64k')        // 適度な音質
-          .audioQuality(5)            // 品質設定（0-9, 0が最高品質）
-          .audioFilters([
-            'silenceremove=1:0:-50dB', // 無音部分の除去
-            'volume=1.5',              // 音量を少し上げる
-            'highpass=200',            // 低周波ノイズの除去
-            'lowpass=3000',            // 高周波ノイズの除去
-            'dynaudnorm'               // 音量の正規化
-          ])
-          .save(outputPath)
-          .on('start', (command) => {
-            console.log('FFmpeg conversion started with command:', command);
-          })
-          .on('progress', (progress: FFmpegProgress) => {
-            progressData = progress;
-            if (progress.percent) {
-              console.log(`Processing: ${Math.round(progress.percent)}% done`);
-            }
-          })
-          .on('end', () => {
-            console.log('Audio conversion completed:', {
-              outputSize: fs.statSync(outputPath).size,
-              duration: progressData.timemark
-            });
-            resolve(null);
-          })
-          .on('error', (err) => {
-            console.error('FFmpeg conversion error:', err);
-            reject(err);
+      ffmpeg(inputPath)
+        .toFormat('mp3')
+        .audioChannels(1)           // モノラル
+        .audioFrequency(16000)      // Whisper推奨のサンプルレート
+        .audioBitrate('64k')        // 適度な音質
+        .audioQuality(5)            // 品質設定（0-9, 0が最高品質）
+        .audioFilters([
+          'silenceremove=1:0:-50dB', // 無音部分の除去
+          'volume=1.5',              // 音量を少し上げる
+          'highpass=200',            // 低周波ノイズの除去
+          'lowpass=3000',            // 高周波ノイズの除去
+          'dynaudnorm'               // 音量の正規化
+        ])
+        .save(outputPath)
+        .on('start', (command) => {
+          console.log('FFmpeg conversion started with command:', command);
+        })
+        .on('progress', (progress: FFmpegProgress) => {
+          progressData = progress;
+          if (progress.percent) {
+            console.log(`Processing: ${Math.round(progress.percent)}% done`);
+          }
+        })
+        .on('end', () => {
+          console.log('Audio conversion completed:', {
+            outputSize: fs.statSync(outputPath).size,
+            duration: progressData.timemark
           });
-      });
-      console.log('Audio conversion successful');
-    } catch (error) {
-      console.error('FFmpeg conversion error:', error);
-      return c.json({ 
-        error: 'Failed to convert audio file',
-        details: error instanceof Error ? error.message : 'Unknown error'
-      }, 500);
-    }
+          resolve(null);
+        })
+        .on('error', (err) => {
+          console.error('FFmpeg conversion error:', err);
+          reject(err);
+        });
+    });
 
     // 変換後のファイルを確認
     const stats = fs.statSync(outputPath);
@@ -181,44 +150,32 @@ app.post('/transcribe', async (c) => {
     });
 
     // Whisperで文字起こし
-    try {
-      console.log('Starting Whisper transcription');
-      const transcription = await openai.audio.transcriptions.create({
-        file: fs.createReadStream(outputPath),
-        model: 'whisper-1',
-        language: 'ja',
-        temperature: 0.2,            // より正確な文字起こしのため低めに設定
-        response_format: 'json'
-      });
+    const transcription = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(outputPath),
+      model: 'whisper-1',
+      language: 'ja',
+      temperature: 0.2,            // より正確な文字起こしのため低めに設定
+      response_format: 'json'
+    });
 
-      console.log('Transcription result:', {
-        success: true,
-        hasText: !!transcription.text,
-        textLength: transcription.text?.length,
-        textPreview: transcription.text?.substring(0, 50)
-      });
+    console.log('Transcription completed:', {
+      hasText: !!transcription.text,
+      textLength: transcription.text?.length,
+      text: transcription.text?.substring(0, 50) + '...' // 最初の50文字のみログ出力
+    });
 
-      // 一時ファイルの削除
-      fs.unlinkSync(inputPath);
-      fs.unlinkSync(outputPath);
+    // 一時ファイルの削除
+    fs.unlinkSync(inputPath);
+    fs.unlinkSync(outputPath);
 
-      if (!transcription.text) {
-        throw new Error('No transcription text received from Whisper API');
-      }
-
-      return c.json({ text: transcription.text });
-    } catch (error) {
-      console.error('Whisper API error:', error);
-      return c.json({ 
-        error: 'Failed to transcribe audio',
-        details: error instanceof Error ? error.message : 'Unknown error'
-      }, 500);
-    }
+    return c.json({ text: transcription.text });
   } catch (error) {
-    console.error('Unexpected transcription error:', error);
+    console.error('Transcription error:', error);
+    // エラーの詳細情報をクライアントに返す
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     return c.json({ 
-      error: 'Unexpected error during transcription',
-      details: error instanceof Error ? error.message : 'Unknown error'
+      error: 'Failed to transcribe audio',
+      details: errorMessage 
     }, 500);
   }
 });
